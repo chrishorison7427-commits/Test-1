@@ -221,6 +221,167 @@ def test_ict_rejects_daily_bars():
         raise AssertionError("daily data must be rejected")
 
 
+# --------------------------------------------------------------------------- #
+# VWAP opening-range momentum and RSI(2) pullback
+# --------------------------------------------------------------------------- #
+def _ny_day(date, base=100.0, volume=1000.0):
+    """One NY session of 5m bars (08:00-15:55) hovering around ``base`` with an opening range of 99.5-100.5."""
+    idx = pd.date_range(f"{date} 08:00", f"{date} 15:55", freq="5min", tz="America/New_York")
+    c = base + 0.02 * np.sin(np.arange(len(idx)))
+    df = pd.DataFrame({"open": c, "high": c + 0.05, "low": c - 0.05, "close": c, "volume": volume}, index=idx)
+    _setbar(df, date, "09:35", h=100.5)
+    _setbar(df, date, "09:45", l=99.5)
+    return df
+
+
+def _setbar(df, date, hhmm, o=None, h=None, l=None, c=None, v=None):
+    ts = pd.Timestamp(f"{date} {hhmm}", tz="America/New_York")
+    for col, val in (("open", o), ("high", h), ("low", l), ("close", c), ("volume", v)):
+        if val is not None:
+            df.loc[ts, col] = val
+    return ts
+
+
+def _vwap_days():
+    d1, d2, d3, d4, d5 = (_ny_day(f"2024-03-0{i}") for i in range(4, 9))
+    t1 = _setbar(d1, "2024-03-04", "10:00", o=100.0, h=100.45, l=99.95, c=100.4)          # inside range: no signal
+    t1 = _setbar(d1, "2024-03-04", "10:05", o=100.4, h=100.8, l=100.35, c=100.7)           # breakout above ORH and VWAP
+    _setbar(d1, "2024-03-04", "10:30", o=100.7, h=101.0, l=100.6, c=100.9)                 # 2nd breakout: ignored (1/day)
+    _setbar(d2, "2024-03-05", "14:25", o=100.0, h=100.9, l=99.95, c=100.8)                 # entry bar would open 14:30
+    t3 = _setbar(d3, "2024-03-06", "14:20", o=100.0, h=100.9, l=99.95, c=100.8)            # last bar allowed
+    t4 = _setbar(d4, "2024-03-07", "10:15", o=100.0, h=100.05, l=99.2, c=99.3)             # breakdown below ORL and VWAP
+    _setbar(d5, "2024-03-08", "10:00", o=100.4, h=103.0, l=100.3, c=100.4, v=100_000.0)    # spike drags VWAP to ~101
+    _setbar(d5, "2024-03-08", "10:05", o=100.4, h=100.9, l=100.35, c=100.8)                # > ORH but < VWAP: no signal
+    t5 = _setbar(d5, "2024-03-08", "10:10", o=100.8, h=101.7, l=100.8, c=101.5)            # above both: signal
+    return pd.concat([d1, d2, d3, d4, d5]), (t1, t3, t4, t5)
+
+
+def test_anchored_vwap_matches_manual_calculation():
+    from indicators import anchored_vwap
+    df = pd.concat([_ny_day("2024-03-04"), _ny_day("2024-03-05", base=105.0)])
+    df["volume"] = np.arange(1, len(df) + 1, dtype=float)
+    day = np.asarray(df.index.year * 10000 + df.index.month * 100 + df.index.day)
+    mod = np.asarray(df.index.hour * 60 + df.index.minute)
+    got = anchored_vwap(df, day, mod >= 570)
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    for d in np.unique(day):
+        m = (day == d) & (mod >= 570)
+        want = (typical[m] * df["volume"][m]).cumsum() / df["volume"][m].cumsum()
+        assert np.allclose(got[m].to_numpy(), want.to_numpy())
+        assert got[(day == d) & (mod < 570)].isna().all()
+
+
+def test_vwap_orb_signal_rules_on_hand_built_days():
+    df, (t1, t3, t4, t5) = _vwap_days()
+    sig = get_strategy("vwap_orb").generate_signals(df)
+    hit = sig[sig["signal"] != 0]
+    assert list(hit.index) == [t1, t3, t4, t5], "wrong set of signal bars"
+    assert hit["signal"].tolist() == [1, 1, -1, 1]
+    assert t1 == pd.Timestamp("2024-03-04 10:05", tz="America/New_York")          # not the 10:00 bar, one per day
+    assert t5 == pd.Timestamp("2024-03-08 10:10", tz="America/New_York")          # VWAP filter delayed it a bar
+    assert np.allclose(hit["sl_dist"], 1.5 * hit["atr"]) and np.allclose(hit["tp_dist"], 1.5 * hit["sl_dist"])
+
+
+def test_vwap_orb_engine_fills_next_open_with_1p5r_target_and_flat_1555():
+    df, (t1, *_rest) = _vwap_days()
+    d1_spike = df[df.index.date == t1.date()]
+    cfg0 = EngineConfig(initial_capital=100_000, slippage_bps=0.0, max_leverage=50.0)
+    sig_spike = get_strategy("vwap_orb").generate_signals(df).loc[d1_spike.index]
+    tp_trade = BacktestEngine(cfg0).run(d1_spike, sig_spike).trades_df.iloc[0]
+    assert tp_trade["exit_reason"] == "TP" and tp_trade["exit_time"] == t1 + pd.Timedelta(minutes=25)  # 10:30 spike
+    assert abs(tp_trade["exit_price"] - tp_trade["tp_price"]) < 1e-12, "TP fills exactly at the target"
+    d1 = d1_spike.copy()      # calm the 10:30 spike so the position runs to the flatten time
+    ohlc = ["open", "high", "low", "close"]
+    d1.loc[t1 + pd.Timedelta(minutes=25), ohlc] = d1.loc[t1 + pd.Timedelta(minutes=20), ohlc].to_numpy()
+    sig = get_strategy("vwap_orb").generate_signals(d1)
+    tr = BacktestEngine(EngineConfig(initial_capital=100_000, slippage_bps=0.0, max_leverage=50.0)).run(d1, sig).trades_df
+    t = tr.iloc[0]
+    assert t["entry_time"] == t1 + pd.Timedelta(minutes=5) and t["entry_price"] == d1.loc[t["entry_time"], "open"]
+    assert abs((t["entry_price"] - t["sl_price"]) - 1.5 * sig.loc[t1, "atr"]) < 1e-9
+    assert abs((t["tp_price"] - t["entry_price"]) - 1.5 * (t["entry_price"] - t["sl_price"])) < 1e-9
+    assert t["exit_reason"] == "Signal" and t["exit_time"] == pd.Timestamp("2024-03-04 15:55", tz="America/New_York")
+
+
+def test_vwap_orb_15m_bars_exit_before_the_close_never_after():
+    raw = dl.generate_synthetic_ohlcv("2024-01-02", "2024-04-30", "15m", seed=6)
+    df, _ = dl.validate_ohlcv(raw, "15m")
+    tr = BacktestEngine(EngineConfig(slippage_bps=0.0, max_leverage=50.0)).run(
+        df, get_strategy("vwap_orb").generate_signals(df)).trades_df
+    x = tr["exit_time"].dt.tz_convert("America/New_York")
+    assert (x.dt.hour * 60 + x.dt.minute).max() <= 15 * 60 + 55
+    e = tr["entry_time"].dt.tz_convert("America/New_York")
+    assert (e.dt.hour * 60 + e.dt.minute).min() >= 10 * 60 and (e.dt.hour * 60 + e.dt.minute).max() < 14 * 60 + 30
+    assert e.dt.date.value_counts().max() == 1
+
+
+def test_vwap_orb_rejects_daily_and_too_coarse_bars():
+    raw = dl.generate_synthetic_ohlcv("2020-01-02", "2020-12-31", "1d")
+    daily, _ = dl.validate_ohlcv(raw, "1d")
+    hourly, _ = dl.validate_ohlcv(dl.generate_synthetic_ohlcv("2024-01-02", "2024-02-29", "1h"), "1h")
+    for frame in (daily, hourly):
+        try:
+            get_strategy("vwap_orb").generate_signals(frame)
+        except ValueError:
+            continue
+        raise AssertionError("daily / 1h bars must be rejected")
+
+
+def test_vwap_orb_has_no_lookahead():
+    for interval in ("5m", "15m"):
+        raw = dl.generate_synthetic_ohlcv("2024-01-02", "2024-03-28", interval, seed=3)
+        df, _ = dl.validate_ohlcv(raw, interval)
+        audit = val.causality_audit(df, get_strategy("vwap_orb"), EngineConfig(slippage_bps=1.0, max_leverage=50.0),
+                                    n_checks=4)
+        assert audit["passed"], audit["failures"]
+
+
+def _manual_wilder_rsi(close: pd.Series, n: int) -> np.ndarray:
+    c, out = close.to_numpy(float), np.full(len(close), np.nan)
+    ag = al = 0.0
+    for i in range(1, len(c)):
+        g, l = max(c[i] - c[i - 1], 0.0), max(c[i - 1] - c[i], 0.0)
+        ag, al = (g, l) if i == 1 else ((1 - 1 / n) * ag + g / n, (1 - 1 / n) * al + l / n)
+        if i >= n:
+            out[i] = (100.0 if ag > 0 else 50.0) if al == 0 else 100.0 - 100.0 / (1.0 + ag / al)
+    return out
+
+
+def test_rsi2_pullback_signals_exits_and_stop_match_independent_calculation():
+    from indicators import atr as atr_fn, rsi_wilder
+    raw = dl.generate_synthetic_ohlcv("2008-01-02", "2024-12-31", "1d", seed=12, annual_vol=0.30)
+    df, _ = dl.validate_ohlcv(raw, "1d")
+    close = df["close"]
+    rsi_manual = _manual_wilder_rsi(close, 2)
+    assert np.allclose(rsi_wilder(close, 2).to_numpy(), rsi_manual, equal_nan=True)
+    sma200, sma5 = close.rolling(200).mean(), close.rolling(5).mean()
+    sig = get_strategy("rsi2_pullback").generate_signals(df)
+    want = ((close > sma200) & (rsi_manual < 10) & atr_fn(df, 14).notna()).astype(int)
+    assert (sig["signal"].to_numpy() == want.to_numpy()).all() and want.sum() > 20
+    assert (sig["exit_long"].to_numpy() == (close > sma5).to_numpy()).all()
+    assert sig["signal"].iloc[:199].eq(0).all(), "no trades before the 200 SMA exists"
+    res = BacktestEngine(EngineConfig(slippage_bps=0.0, max_leverage=10.0)).run(df, sig)
+    tr = res.trades_df
+    assert len(tr) > 20 and set(tr["direction"]) == {"Long"}
+    atr_at_signal = sig["atr"].shift(1).reindex(tr["entry_time"]).to_numpy()
+    assert np.allclose(tr["entry_price"] - tr["sl_price"], 3.0 * atr_at_signal), "stop = fill - 3 ATR"
+    assert tr["tp_price"].isna().all(), "no profit target"
+    entry_open = df["open"].reindex(tr["entry_time"]).to_numpy()
+    assert np.allclose(tr["entry_price"], entry_open), "entries fill at the next bar's open"
+    sig_exits = tr[tr["exit_reason"] == "Signal"]
+    prev_close = close.shift(1).reindex(sig_exits["exit_time"]).to_numpy()
+    prev_sma5 = sma5.shift(1).reindex(sig_exits["exit_time"]).to_numpy()
+    assert (prev_close > prev_sma5).all(), "exit only after a close above the 5 SMA, filled next open"
+
+
+def test_rsi2_pullback_has_no_lookahead():
+    for interval, start in (("1d", "2012-01-02"), ("1h", "2023-01-02")):
+        raw = dl.generate_synthetic_ohlcv(start, "2024-12-31", interval, seed=5)
+        df, _ = dl.validate_ohlcv(raw, interval)
+        audit = val.causality_audit(df, get_strategy("rsi2_pullback"), EngineConfig(slippage_bps=1.0, max_leverage=10.0),
+                                    n_checks=4)
+        assert audit["passed"], audit["failures"]
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     for name, fn in tests:

@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from indicators import atr as atr_indicator
-from indicators import rolling_percentile_rank, rolling_zscore, sma
+from indicators import anchored_vwap, rolling_percentile_rank, rolling_zscore, rsi_wilder, sma
 
 SIGNAL_COLUMNS = ["signal", "atr", "sl_dist", "tp_dist", "trail_mult", "exit_long", "exit_short"]
 
@@ -72,6 +72,7 @@ class BaseStrategy(ABC):
     name: str = "base"
     label: str = "Base strategy"
     description: str = ""
+    supported_intervals: Optional[Tuple[str, ...]] = None   # timeframes it is designed for (dashboard hint)
     data_session: str = "rth"      # "extended" = needs overnight / pre-market bars (futures, or equities with prepost)
     PARAM_SPECS: Tuple[ParamSpec, ...] = ()
     OPT_GRID: Dict[str, List[Any]] = {}
@@ -242,6 +243,7 @@ class OpeningRangeBreakout(BaseStrategy):
     """
 
     name = "orb"
+    supported_intervals = ("5m", "15m", "1h")
     label = "Intraday Opening Range Breakout"
     description = "Opening-range breakout + volume confirmation + trailing ATR stop, flat by the close."
     PARAM_SPECS = (
@@ -365,6 +367,7 @@ class ICTLiquiditySweep(BaseStrategy):
     """
 
     name = "ict_sweep"
+    supported_intervals = ("5m", "15m")
     label = "ICT Liquidity Sweep (NY Killzone)"
     description = ("Pre-08:30 NY range sweep + reclaim, optional FVG / MSS / displacement confirmation, "
                    "SL beyond the sweep, R-multiple or liquidity target, 1 trade/day, flat 15:55.")
@@ -540,7 +543,7 @@ class ICTLiquiditySweep(BaseStrategy):
                 tp_rr[i] = p["rr"]
             signal[i], sl_px[i] = side, sl
 
-        flat = pd.Series(mod + bar_min >= flat_m, index=idx)   # exit fills at the next bar's open
+        flat = pd.Series(_flat_flags(mod, bar_min, flat_m), index=idx)   # exit fills at the next bar's open
         frame = self.build_signal_frame(df, pd.Series(signal, index=idx), atr_s,
                                         pd.Series(np.nan, index=idx), exit_long=flat, exit_short=flat)
         frame["sl_price"], frame["tp_price"], frame["tp_rr"] = sl_px, tp_px, tp_rr
@@ -548,10 +551,180 @@ class ICTLiquiditySweep(BaseStrategy):
 
 
 # --------------------------------------------------------------------------- #
+# (d) VWAP opening-range momentum and (e) RSI(2) pullback
+# =========================================================================== #
+def _ny_clock(index: pd.DatetimeIndex) -> Tuple[np.ndarray, np.ndarray]:
+    """(minute-of-day, NY calendar-date key) arrays on the America/New_York wall clock."""
+    ny = _to_new_york(index)
+    mod = np.asarray(ny.hour, dtype=np.int64) * 60 + np.asarray(ny.minute, dtype=np.int64)
+    day_key = (np.asarray(ny.year, dtype=np.int64) * 10000 + np.asarray(ny.month, dtype=np.int64) * 100
+               + np.asarray(ny.day, dtype=np.int64))
+    return mod, day_key
+
+
+def _flat_flags(mod: np.ndarray, bar_min: int, flat_m: int) -> np.ndarray:
+    """
+    Bars after whose close the engine must exit, so that the fill lands on the open of the LAST bar that
+    starts at or before ``flat_m`` (never later). 5m bars + 15:55 -> fill at 15:55; 15m bars -> fill at 15:45.
+    Early-close days (half-days) are not detected.
+    """
+    return (mod + 2 * bar_min) > flat_m
+
+
+class VWAPMomentumStrategy(BaseStrategy):
+    """
+    VWAP Opening Range Momentum (all clocks America/New_York, 5m or 15m bars).
+
+    * Opening range : high / low of the bars that lie completely inside [or_start, or_end) (09:30-10:00).
+    * VWAP          : volume-weighted average of the typical price (H+L+C)/3, anchored at ``vwap_anchor``
+                      (09:30) and restarted every NY day.
+    * Window        : signal bars start at/after or_end and the entry bar must open before ``entry_end_hour``
+                      (14:30). At most ONE trade per NY day (the first trigger).
+    * Long          : close > opening-range high AND close > VWAP.
+    * Short         : close < opening-range low AND close < VWAP.
+    * Stop / target : stop = sl_atr x ATR (1.5), target = rr x the stop distance (1.5R), both anchored on
+                      the actual next-open fill by the engine.
+    * Exit          : flat at the open of the last bar starting at or before flat_time (15:55).
+
+    Causality: the opening range and VWAP only use bars <= t; a bar that is not finished by ``or_end`` never
+    contributes to the range. The anchor time must fall on the same NY calendar day (use 00:00 for a
+    whole-day VWAP). Needs real volume.
+    """
+
+    name = "vwap_orb"
+    label = "VWAP Opening Range Momentum"
+    description = ("Opening-range (09:30-10:00 NY) breakout confirmed by session VWAP; 1 trade/day, "
+                   "1.5 ATR stop, 1.5R target, flat 15:55.")
+    supported_intervals = ("5m", "15m")
+    PARAM_SPECS = (
+        ParamSpec("or_start", "Opening range start (NY HH:MM)", "text", "09:30"),
+        ParamSpec("or_end", "Opening range end (NY HH:MM)", "text", "10:00"),
+        ParamSpec("entry_end_hour", "Entry window end hour (NY)", "float", 14.5, 10.5, 15.5, 0.25,
+                  "14.5 = 14:30. The entry bar must open before this time.", slider=True),
+        ParamSpec("vwap_anchor", "VWAP anchor (NY HH:MM)", "text", "09:30"),
+        ParamSpec("atr_window", "ATR window", "int", 14, 5, 50, 1, slider=True),
+        ParamSpec("sl_atr", "Stop (x ATR)", "float", 1.5, 0.5, 4.0, 0.1, slider=True),
+        ParamSpec("rr", "Target (R multiple of the stop)", "float", 1.5, 0.5, 4.0, 0.25, slider=True),
+        ParamSpec("flat_time", "Force-flat time (NY HH:MM)", "text", "15:55"),
+        ParamSpec("allow_long", "Allow longs", "bool", True),
+        ParamSpec("allow_short", "Allow shorts", "bool", True),
+    )
+    OPT_GRID = {
+        "sl_atr": [1.0, 1.5, 2.0],
+        "rr": [1.0, 1.5, 2.0],
+        "entry_end_hour": [12.0, 14.5],
+    }
+
+    def _validate(self) -> None:
+        p = self.params
+        or_s, or_e = _hhmm_to_minutes(p["or_start"]), _hhmm_to_minutes(p["or_end"])
+        _hhmm_to_minutes(p["vwap_anchor"])
+        if or_e <= or_s:
+            raise ValueError("or_end must be later than or_start.")
+        if int(round(p["entry_end_hour"] * 60)) <= or_e:
+            raise ValueError("Entry window end must be later than the opening range end.")
+        if _hhmm_to_minutes(p["flat_time"]) <= int(round(p["entry_end_hour"] * 60)):
+            raise ValueError("flat_time must be later than the entry window end.")
+
+    @property
+    def warmup_bars(self) -> int:
+        return self.params["atr_window"] + 2
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            raise ValueError("VWAP Opening Range Momentum needs a DatetimeIndex.")
+        bar_min = infer_bar_minutes(idx)
+        if bar_min >= 1440:
+            raise ValueError("VWAP Opening Range Momentum needs intraday bars (5m / 15m), not daily data.")
+        or_s, or_e = _hhmm_to_minutes(p["or_start"]), _hhmm_to_minutes(p["or_end"])
+        if bar_min > or_e - or_s:
+            raise ValueError(f"{bar_min}-minute bars are too coarse for a {or_e - or_s}-minute opening range.")
+        vwap_m, flat_m = _hhmm_to_minutes(p["vwap_anchor"]), _hhmm_to_minutes(p["flat_time"])
+        entry_end = int(round(p["entry_end_hour"] * 60))
+        mod, day_key = _ny_clock(idx)
+
+        in_or = (mod >= or_s) & (mod + bar_min <= or_e)          # only bars fully finished by or_end
+        or_hi = df["high"].where(in_or).groupby(day_key).cummax().groupby(day_key).ffill()
+        or_lo = df["low"].where(in_or).groupby(day_key).cummin().groupby(day_key).ffill()
+        vwap = anchored_vwap(df, day_key, mod >= vwap_m)
+        if vwap.notna().sum() == 0:
+            raise ValueError("VWAP is undefined: the data has no volume (or no bars after the anchor time).")
+        atr_s = atr_indicator(df, p["atr_window"])
+        close = df["close"]
+
+        can_enter = (pd.Series((mod >= or_e) & (mod + bar_min < entry_end), index=idx)
+                     & atr_s.notna() & or_hi.notna() & vwap.notna())
+        long_c = can_enter & (close > or_hi) & (close > vwap) & p["allow_long"]
+        short_c = can_enter & (close < or_lo) & (close < vwap) & p["allow_short"]
+        any_c = long_c | short_c
+        first = any_c & (any_c.astype(int).groupby(day_key).cumsum() == 1)       # max one trade per day
+        signal = (first & long_c).astype(int) - (first & short_c).astype(int)
+
+        sl = (p["sl_atr"] * atr_s).where(signal != 0)
+        tp = (p["rr"] * sl).where(signal != 0)
+        flat = pd.Series(_flat_flags(mod, bar_min, flat_m), index=idx)
+        return self.build_signal_frame(df, signal, atr_s, sl, tp_dist=tp, exit_long=flat, exit_short=flat)
+
+
+class RSI2MeanReversionStrategy(BaseStrategy):
+    """
+    Regime-Filtered RSI(2) Pullback (long-only, 1h or 1d bars).
+
+    * Regime : close above the ``regime_window`` SMA (200).
+    * Entry  : RSI(``rsi_window`` = 2, Wilder) below ``rsi_entry`` (10) on a bar close; the engine buys the
+               next bar's open.
+    * Exit   : close above the ``exit_window`` SMA (5) -> sells the next bar's open.
+    * Safety : catastrophic stop ``sl_atr`` x ATR (3.0 x ATR(14)) below the actual fill. No profit target.
+
+    Only one position at a time (signals while in a trade are ignored by the engine). Everything uses
+    bars <= t.
+    """
+
+    name = "rsi2_pullback"
+    label = "Regime-Filtered RSI(2) Pullback"
+    description = ("Long-only: buy RSI(2) < 10 above the 200 SMA, exit on a close above the 5 SMA, "
+                   "3 ATR catastrophic stop.")
+    supported_intervals = ("1h", "1d")
+    PARAM_SPECS = (
+        ParamSpec("regime_window", "Regime SMA window", "int", 200, 50, 400, 5, slider=True),
+        ParamSpec("exit_window", "Exit SMA window", "int", 5, 2, 20, 1, slider=True),
+        ParamSpec("rsi_window", "RSI window", "int", 2, 2, 10, 1, slider=True),
+        ParamSpec("rsi_entry", "Entry: RSI below", "float", 10.0, 1.0, 40.0, 1.0, slider=True),
+        ParamSpec("atr_window", "ATR window", "int", 14, 5, 50, 1, slider=True),
+        ParamSpec("sl_atr", "Catastrophic stop (x ATR)", "float", 3.0, 1.0, 8.0, 0.25, slider=True),
+    )
+    OPT_GRID = {
+        "rsi_entry": [5.0, 10.0, 15.0],
+        "exit_window": [3, 5, 7],
+        "sl_atr": [2.0, 3.0, 4.0],
+    }
+
+    @property
+    def warmup_bars(self) -> int:
+        p = self.params
+        return max(p["regime_window"], p["atr_window"] + 1, p["rsi_window"] + 1, p["exit_window"])
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        close = df["close"]
+        atr_s = atr_indicator(df, p["atr_window"])
+        regime = sma(close, p["regime_window"])
+        exit_ma = sma(close, p["exit_window"])
+        rsi = rsi_wilder(close, p["rsi_window"])
+        # NaN comparisons are False, so nothing fires during indicator warm-up.
+        signal = ((close > regime) & (rsi < p["rsi_entry"]) & atr_s.notna()).astype(int)
+        sl = (p["sl_atr"] * atr_s).where(signal != 0)
+        return self.build_signal_frame(df, signal, atr_s, sl, exit_long=(close > exit_ma))
+
+
+# --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
 STRATEGY_REGISTRY: Dict[str, type] = {
-    cls.name: cls for cls in (VolFilteredMeanReversion, OpeningRangeBreakout, ICTLiquiditySweep)
+    cls.name: cls for cls in (VolFilteredMeanReversion, OpeningRangeBreakout, ICTLiquiditySweep,
+                              VWAPMomentumStrategy, RSI2MeanReversionStrategy)
 }
 
 

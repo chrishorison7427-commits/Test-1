@@ -70,3 +70,34 @@ def rolling_percentile_rank(series: pd.Series, window: int) -> pd.Series:
     rank[np.isnan(win).any(axis=1)] = np.nan
     out[window - 1:] = rank
     return pd.Series(out, index=series.index)
+
+
+def rsi_wilder(series: pd.Series, window: int = 14) -> pd.Series:
+    """
+    Wilder's RSI (0-100). Gains and losses are smoothed with Wilder's method (EWM, alpha = 1 / window,
+    seeded from the first observation) and converge to the textbook seeded-SMA version after ~3x ``window``
+    bars. A window with no losses gives 100, and with no movement at all gives 50.
+    """
+    delta = series.diff()
+    avg_gain = delta.clip(lower=0.0).ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
+    avg_loss = (-delta).clip(lower=0.0).ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    out = 100.0 - 100.0 / (1.0 + rs)
+    no_loss = (avg_loss == 0.0) & avg_gain.notna()
+    return out.where(~no_loss, np.where(avg_gain > 0.0, 100.0, 50.0))
+
+
+def anchored_vwap(df: pd.DataFrame, group_key, active) -> pd.Series:
+    """
+    Cumulative volume-weighted average price, restarted for every ``group_key`` value (e.g. the NY date).
+
+    The typical price (high + low + close) / 3 of each bar is weighted by its volume. Only bars where
+    ``active`` is True contribute (this sets the anchor time); other bars are NaN. Bar ``t`` includes
+    its own volume, which is known at its close, so the value is causal.
+    """
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol = df["volume"].astype(float)
+    on = pd.Series(np.asarray(active, dtype=bool), index=df.index)
+    cum_pv = (typical * vol).where(on, 0.0).groupby(group_key).cumsum()
+    cum_v = vol.where(on, 0.0).groupby(group_key).cumsum()
+    return (cum_pv / cum_v.replace(0.0, np.nan)).where(on)

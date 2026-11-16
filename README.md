@@ -11,7 +11,7 @@ Python 3.10+ is required.
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python test_engine.py              # 19 invariant tests, should all PASS
+python test_engine.py              # 27 invariant tests, should all PASS
 streamlit run app.py               # opens the dark-mode dashboard
 ```
 
@@ -60,6 +60,29 @@ histories and requires that signals and already-closed trades never change when 
 | `mean_reversion` | Bollinger z-score fade + 200-bar regime filter + ATR volatility gate, ATR SL/TP | daily or intraday |
 | `orb` | Opening-range breakout, volume confirmation, trailing ATR stop | intraday (5m / 15m / 1h) |
 | `ict_sweep` | ICT liquidity sweep in the NY killzone (below) | intraday **with overnight bars** |
+| `vwap_orb` | VWAP Opening Range Momentum (below) | 5m / 15m intraday, needs volume |
+| `rsi2_pullback` | Regime-filtered RSI(2) pullback (below) | 1h / 1d |
+
+### VWAP Opening Range Momentum (`vwap_orb`)
+
+All clocks are `America/New_York`. Anchored VWAP = cumulative volume-weighted typical price (H+L+C)/3 from 09:30,
+restarted each day. Opening range = high / low of the bars completely finished inside 09:30-10:00.
+Signal bars start at or after 10:00 and the entry bar must open before 14:30 (slider). **Max 1 trade per day**
+(first trigger). **Long:** close > ORH and close > VWAP. **Short:** close < ORL and close < VWAP.
+Stop = 1.5 x ATR, target = 1.5 x the stop distance (both sliders), measured from the real next-open fill.
+
+### Regime-Filtered RSI(2) Pullback (`rsi2_pullback`)
+
+Long-only. **Entry:** close > 200 SMA and Wilder RSI(2) < 10, filled at the next open. **Exit:** close above the
+5 SMA (filled at the next open). **Safety stop:** 3.0 x ATR(14) below the actual fill, no profit target.
+All windows and thresholds are sliders. The dashboard warns when the timeframe is not the one a strategy was
+designed for.
+
+### Force-flat time
+
+For intraday strategies the engine exits at the open of the **last bar that starts at or before the flat time**,
+so a position is never held past it: 5m bars and 15:55 give an exit at 15:55, 15m bars give 15:45.
+Early-close days (half-days) are not detected.
 
 ### ICT Liquidity Sweep (`ict_sweep`)
 

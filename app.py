@@ -148,6 +148,9 @@ interval = sb.selectbox("Timeframe", INTERVALS,
 strategies = list_strategies()
 strategy_key = sb.selectbox("Strategy", list(strategies), format_func=lambda k: strategies[k])
 sb.caption(STRATEGY_REGISTRY[strategy_key].description)
+_supported = STRATEGY_REGISTRY[strategy_key].supported_intervals
+if _supported and interval not in _supported:
+    sb.warning(f"This strategy is designed for {' / '.join(_supported)} bars; you selected {interval}.")
 
 default_lookback = {"1d": 365 * 5, "1h": 600, "15m": 55, "5m": 55}[interval]
 with sb.form("controls"):
